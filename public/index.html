@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deepgram STT Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+        }
+
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+
+        #transcript {
+            min-height: 200px;
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 4px;
+            background-color: #f9f9f9;
+            white-space: pre-wrap;
+        }
+
+        button {
+            padding: 10px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+
+        button.recording {
+            background-color: #dc3545;
+        }
+
+        /* Animación de ondas de sonido */
+        .sound-wave {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            height: 60px;
+            margin: 20px 0;
+        }
+
+        .bar {
+            width: 6px;
+            height: 20px;
+            background: #4CAF50;
+            border-radius: 3px;
+            animation: sound 0.8s infinite ease-out;
+            transform-origin: bottom;
+        }
+
+        @keyframes sound {
+            0% {
+                transform: scaleY(0.3);
+            }
+
+            50% {
+                transform: scaleY(1);
+            }
+
+            100% {
+                transform: scaleY(0.3);
+            }
+        }
+
+        /* Añade un retraso a cada barra para el efecto de onda */
+        .bar:nth-child(1) {
+            animation-delay: 0.1s;
+        }
+
+        .bar:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .bar:nth-child(3) {
+            animation-delay: 0.3s;
+        }
+
+        .bar:nth-child(4) {
+            animation-delay: 0.4s;
+        }
+
+        .bar:nth-child(5) {
+            animation-delay: 0.5s;
+        }
+
+        /* Estado inicial: oculto */
+        #soundWave {
+            display: none;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        /* Estado activo */
+        #soundWave.active {
+            display: flex;
+            opacity: 1;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Deepgram STT Demo</h1>
+
+        <div id="status" class="status disconnected">Status: Disconnected</div>
+
+        <button id="startButton">Start Recording</button>
+        <div id="soundWave" class="sound-wave">
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+        </div>
+
+        <h2>Transcript:</h2>
+        <div id="transcript"></div>
+
+        <div>
+            <h3>How to use:</h3>
+            <ol>
+                <li>Click "Start Recording" to begin capturing audio from your microphone</li>
+                <li>Speak clearly into your microphone</li>
+                <li>Your speech will be transcribed in real-time</li>
+                <li>Click the button again to stop recording</li>
+            </ol>
+        </div>
+    </div>
+
+    <script>
+        // WebSocket connection
+        let socket;
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let clientId = null;
+
+        // DOM elements
+        const statusElement = document.getElementById('status');
+        const startButton = document.getElementById('startButton');
+        const transcriptElement = document.getElementById('transcript');
+
+        // Initialize WebSocket connection
+        function connectWebSocket() {
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            const wsUrl = wsProtocol + window.location.host;
+
+            socket = new WebSocket(wsUrl);
+
+            socket.onopen = () => {
+                console.log('[FRONTEND] WebSocket: Conexión establecida con el servidor');
+                statusElement.textContent = 'Status: Connected';
+                statusElement.className = 'status connected';
+                startButton.disabled = false;
+                
+                console.log('[FRONTEND] Mostrando mensaje de bienvenida en la interfaz');
+                transcriptElement.textContent = 'El servidor dice: aloha lokita\n\n';
+                
+                // Verificar si el elemento se actualizó correctamente
+                console.log('[FRONTEND] Contenido del elemento de transcripción:', transcriptElement.textContent);
+            };
+
+            socket.onclose = () => {
+                console.log('Disconnected from WebSocket server');
+                statusElement.textContent = 'Status: Disconnected';
+                statusElement.className = 'status disconnected';
+                startButton.disabled = true;
+
+                // Try to reconnect after 5 seconds
+                setTimeout(connectWebSocket, 5000);
+            };
+
+            socket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                statusElement.textContent = 'Status: Error - ' + error.message;
+                statusElement.className = 'status disconnected';
+            };
+
+            socket.onmessage = (event) => {
+                try {
+                    console.log('[FRONTEND] Mensaje recibido del servidor:', event.data);
+                    const data = JSON.parse(event.data);
+                    console.log('[FRONTEND] Mensaje parseado:', data);
+
+                    if (data.type === 'connection') {
+                        clientId = data.clientId;
+                        console.log('[FRONTEND] ID de cliente asignado:', clientId);
+                        console.log('[FRONTEND] Estado actual de la transcripción:', transcriptElement.textContent);
+                    }
+                    else if (data.type === 'transcript' && data.text) {
+                        console.log('[FRONTEND] Recibida nueva transcripción:', data.text);
+                        // Append new transcript
+                        transcriptElement.textContent += data.text + '\n';
+                        console.log('[FRONTEND] Contenido actualizado de la transcripción:', transcriptElement.textContent);
+                        // Auto-scroll to bottom
+                        transcriptElement.scrollTop = transcriptElement.scrollHeight;
+                    }
+                    else if (data.type === 'error') {
+                        console.error('[FRONTEND] Error del servidor:', data.message);
+                        alert('Error: ' + data.message);
+                    }
+                } catch (error) {
+                    console.error('[FRONTEND] Error procesando mensaje:', error);
+                }
+            };
+        }
+
+        // Start/stop recording
+        startButton.addEventListener('click', async () => {
+            if (isRecording) {
+                // Al detener la grabación
+                soundWave.classList.remove('active');
+                setTimeout(() => {
+                    soundWave.style.display = 'none';
+                }, 300); // Espera a que termine la transición
+                // Stop recording
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.stop();
+                }
+                startButton.textContent = 'Start Recording';
+                startButton.classList.remove('recording');
+                isRecording = false;
+            } else {
+                try {
+                    // Al comenzar a grabar (dentro del evento click del botón)
+                    soundWave.style.display = 'flex';
+                    setTimeout(() => soundWave.classList.add('active'), 10);
+
+                    // Request microphone access
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+                    // Configurar el análisis de audio
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    analyser = audioContext.createAnalyser();
+                    const source = audioContext.createMediaStreamSource(stream);
+                    source.connect(analyser);
+                    analyser.fftSize = 32;
+                    dataArray = new Uint8Array(analyser.frequencyBinCount);
+                    startAudioVisualization();
+
+                    // Create media recorder
+                    mediaRecorder = new MediaRecorder(stream, {
+                        mimeType: 'audio/webm;codecs=opus',
+                        audioBitsPerSecond: 16000
+                    });
+
+                    // Handle data available event
+                    mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0) {
+                            // Convert blob to array buffer and send via WebSocket
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                                if (socket.readyState === WebSocket.OPEN) {
+                                    socket.send(reader.result);
+                                }
+                            };
+                            reader.readAsArrayBuffer(event.data);
+                        }
+                    };
+
+                    // Start recording
+                    mediaRecorder.start(250); // Collect 250ms of audio before sending
+                    startButton.textContent = 'Stop Recording';
+                    startButton.classList.add('recording');
+                    isRecording = true;
+
+                    // Clear previous transcript
+                    transcriptElement.textContent = '';
+
+                    console.log('Recording started');
+                } catch (error) {
+                    console.error('Error accessing microphone:', error);
+                    alert('Could not access microphone. Please check permissions.');
+                }
+            }
+        });
+
+        // Función para visualización de audio
+        function startAudioVisualization() {
+            if (!analyser) return;
+            
+            analyser.getByteFrequencyData(dataArray);
+            const bars = document.querySelectorAll('.bar');
+            const step = Math.floor(dataArray.length / bars.length);
+            
+            bars.forEach((bar, i) => {
+                const value = dataArray[i * step] || 0;
+                const height = Math.max(5, value / 2); // Mínimo 5% de altura
+                bar.style.height = `${height}%`;
+            });
+            
+            animationId = requestAnimationFrame(startAudioVisualization);
+        }
+        
+        function stopAudioVisualization() {
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+            // Resetear las barras
+            document.querySelectorAll('.bar').forEach(bar => {
+                bar.style.height = '5%';
+            });
+        }
+
+        // Initialize
+        startButton.disabled = true;
+        connectWebSocket();
+        
+        // Limpiar al cerrar la página
+        window.addEventListener('beforeunload', () => {
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+            if (socket) {
+                socket.close();
+            }
+        });
+    </script>
+</body>
+
+</html>
