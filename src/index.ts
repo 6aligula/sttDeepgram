@@ -1,106 +1,83 @@
+import { WebSocketServer, WebSocket } from "ws";
 import { createClient, LiveTranscriptionEvents } from "@deepgram/sdk";
-import * as dotenv from 'dotenv';
-import fetch from 'node-fetch';
-import { WebSocket } from 'ws';
+import * as dotenv from "dotenv"; dotenv.config();
 
-// Load environment variables
-dotenv.config();
-
-// URL for the realtime streaming audio (BBC World Service as an example)
-const STREAM_URL = "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service";
-
-// Validate API key
 const apiKey = process.env.DEEPGRAM_API_KEY;
-if (!apiKey) {
-  console.error('Please set the DEEPGRAM_API_KEY environment variable');
-  process.exit(1);
+if (!apiKey) throw new Error("DEEPGRAM_API_KEY missing");
+
+function newDeepgramConn() {
+  const dg = createClient(process.env.DEEPGRAM_API_KEY).listen.live({
+    model: "general",        // ← Deepgram elegirá polaris o base según tu plan
+    encoding: "linear16",
+    sample_rate: 16000,
+    language: "es",       // o "es-419" si es latam
+    interim_results: true,
+    smart_format: true,
+    endpointing: 400
+  });
+
+  dg.on(LiveTranscriptionEvents.Transcript, m => {
+    const text = m.channel?.alternatives?.[0]?.transcript;
+    if (text) {
+      console.log(m.is_final ? "📄" : "⋯", text);
+    }
+  });
+
+  dg.on(LiveTranscriptionEvents.Open,   () => console.log("🟢 DG socket OPEN"));
+  dg.on(LiveTranscriptionEvents.Close,  () => console.log("⚪ DG socket CLOSED"));
+  dg.on(LiveTranscriptionEvents.Error,  e  => console.error("🔴 DG ERROR:", e));
+
+  dg.on(LiveTranscriptionEvents.Transcript, m => {
+    if (m.is_final) console.log(m.channel.alternatives[0].transcript);
+  });
+
+  // auto-close antes del hard-timeout GCP
+  setTimeout(() => dg.finish(), 55 * 60 * 1000);
+  return dg;
 }
 
-async function transcribeLiveAudio() {
-  console.log('Starting Deepgram live transcription...');
-  console.log('Connecting to audio stream:', STREAM_URL);
-  
-  try {
-    // Create a Deepgram client
-    const deepgram = createClient(apiKey);
+/* ─────────────────────  WebSocket server ─────────────────── */
+const wss = new WebSocketServer({ port: 8080 });
+console.log("🌐 WS bridge listening on ws://0.0.0.0:8080");
 
-    // Create a live transcription connection
-    const connection = deepgram.listen.live({
-      model: "nova-3",
-      language: "en-US",
-      smart_format: true,
-      interim_results: true,
-      utterance_end_ms: 1000, // End of utterance detection (1 second of silence)
-    });
+wss.on("connection", (client, req) => {
+  const ip = req.socket.remoteAddress;
+  console.log(`📶 Client CONNECTED from ${ip}`);
 
-    // Set up event handlers
-    connection.on(LiveTranscriptionEvents.Open, () => {
-      console.log('\nConnection to Deepgram established!');
-      console.log('Listening for speech... (Press Ctrl+C to stop)\n');
-      
-      // Fetch the audio stream and send it to Deepgram
-      fetch(STREAM_URL)
-        .then(response => {
-          if (!response.body) {
-            throw new Error('No response body from audio stream');
-          }
-          
-          // Get the readable stream from the response
-          const readable = response.body;
-          
-          // Send audio data to Deepgram as it arrives
-          readable.on('data', (chunk: Buffer) => {
-            if (connection.getReadyState() === WebSocket.OPEN) {
-              connection.send(chunk);
-            }
-          });
-          
-          readable.on('end', () => {
-            console.log('\nAudio stream ended');
-            connection.finish();
-          });
-          
-          readable.on('error', (error) => {
-            console.error('Stream error:', error);
-            connection.finish();
-          });
-        })
-        .catch(error => {
-          console.error('Error fetching audio stream:', error);
-          connection.finish();
-        });
-    });
+  const dg = newDeepgramConn();
+  let ready = false;
+  const backlog: Buffer[] = [];
 
-    // Handle transcription results
-    connection.on(LiveTranscriptionEvents.Transcript, (data) => {
-      const transcript = data.channel.alternatives[0].transcript;
-      if (transcript && data.is_final) {
-        console.log(`[${new Date().toISOString()}] ${transcript}`);
-      }
-    });
+  dg.on(LiveTranscriptionEvents.Open, () => {
+    ready = true;
+    console.log("↗️  DG ready → flushing", backlog.length, "buffered chunks");
+    backlog.forEach(buf => dg.send(buf));
+    backlog.length = 0;
+  });
 
-    // Handle errors
-    connection.on(LiveTranscriptionEvents.Error, (error) => {
-      console.error('Deepgram error:', error);
-    });
+  client.on("message", chunk => {
+    if (ready && dg.getReadyState() === WebSocket.OPEN) {
+      dg.send(chunk as Buffer);
+    } else {
+      backlog.push(chunk as Buffer);
+    }
+  });
 
-    // Handle connection close
-    connection.on(LiveTranscriptionEvents.Close, () => {
-      console.log('\nConnection to Deepgram closed');
-    });
+  /* Keep-alive pings cada 8 s para no perder la conexión móvil */
+  const pingId = setInterval(() => client.ping(), 8_000);
 
-    // Handle process termination
-    process.on('SIGINT', () => {
-      console.log('\nStopping transcription...');
-      connection.finish();
-      process.exit(0);
-    });
+  client.on("pong", () => console.log(`🏓  Pong from ${ip}`));
 
-  } catch (error) {
-    console.error('Error:', error);
-    process.exit(1);
-  }
-}
+  client.on("close", (code, reason) => {
+    console.log(`❎ Client ${ip} CLOSED (${code}) ${reason.toString()}`);
+    clearInterval(pingId);
+    dg.finish();
+  });
 
-// Start the transcription
-transcribeLiveAudio();
+  client.on("error", err => {
+    console.error(`🚨 WS error with ${ip}:`, err);
+    client.terminate();
+    clearInterval(pingId);
+    dg.finish();
+  });
+});
